@@ -1,7 +1,7 @@
 import schedule
 import time
 from flask import Flask
-from utils.funding import check_all_exchanges
+from funding import check_all_exchanges  # Updated import path
 
 app = Flask(__name__)
 
