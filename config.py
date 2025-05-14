@@ -1,0 +1,4 @@
+# IMPORTANT: DO NOT COMMIT THIS FILE IF IT CONTAINS SECRETS!
+
+TELEGRAM_BOT_TOKEN = "your_bot_token_here"
+TELEGRAM_CHAT_ID = "your_chat_id_here"
