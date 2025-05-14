@@ -1,16 +1,34 @@
 import schedule
 import time
+from flask import Flask
 from utils.funding import check_all_exchanges
+
+app = Flask(__name__)
 
 def job():
     print("[INFO] Running funding rate check job...")
     check_all_exchanges()
 
-# Run the job every minute (you can change this if needed)
+# Schedule job to run every minute
 schedule.every(60).seconds.do(job)
 
-print("[INFO] Funding rate alert bot started.")
+# Define a simple route for health check
+@app.route("/")
+def health_check():
+    return "Funding rate alert bot is running!"
 
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+if __name__ == "__main__":
+    # Start Flask web service and schedule job
+    from threading import Thread
+
+    def run_schedule():
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+
+    # Start the schedule in a separate thread
+    schedule_thread = Thread(target=run_schedule)
+    schedule_thread.start()
+
+    # Run Flask server
+    app.run(host="0.0.0.0", port=5000)
