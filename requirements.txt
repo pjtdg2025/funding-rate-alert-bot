@@ -2,3 +2,5 @@ requests
 schedule
 python-telegram-bot
 flask
+aiohttp
+httpx
