@@ -1,82 +1,115 @@
-import logging
 import asyncio
-from aiohttp import web
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, filters
-)
+import httpx
+import logging
+from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Bot
 
-# --- Configuration ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
-WEBHOOK_URL = "https://YOUR_RENDER_URL_HERE/webhook"  # Replace with your Render domain
-PORT = 10000  # Port Render uses for web service
+# === Configuration ===
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
+EXCHANGES = ["binance", "bybit", "okx", "mexc"]
 
-# --- Logging ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = Bot(token=BOT_TOKEN)
 
-# --- Flask-style aiohttp webhook handler ---
-async def telegram_webhook_handler(request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return web.Response()
-    except Exception as e:
-        logger.error(f"Error in webhook handler: {e}")
-        return web.Response(status=500)
+# === Funding Rate Fetch Functions ===
+async def fetch_binance():
+    url = "https://fapi.binance.com/fapi/v1/fundingRate"
+    params = {"limit": 1}
+    async with httpx.AsyncClient() as client:
+        res = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+        data = res.json()
+        return [
+            {
+                "symbol": x["symbol"],
+                "fundingRate": float(x["lastFundingRate"]),
+                "nextFundingTime": int(x["nextFundingTime"]),
+            }
+            for x in data
+        ]
 
-# --- /start command ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is running!")
+async def fetch_bybit():
+    url = "https://api.bybit.com/v2/public/tickers"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        tickers = res.json()["result"]
+        return [
+            {
+                "symbol": x["symbol"],
+                "fundingRate": float(x.get("funding_rate", 0.0)),
+                "nextFundingTime": int(datetime.utcnow().timestamp() + 60 * 60 * 8),
+            }
+            for x in tickers if x["symbol"].endswith("USDT")
+        ]
 
-# --- TEMP handler to log your chat ID ---
-async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    logger.info(f"👤 User Chat ID: {chat_id}")
-    await update.message.reply_text(f"Your chat ID is: {chat_id}")
+async def fetch_okx():
+    url = "https://www.okx.com/api/v5/public/funding-rate?instType=SWAP"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        tickers = res.json()["data"]
+        return [
+            {
+                "symbol": x["instId"],
+                "fundingRate": float(x["fundingRate"]),
+                "nextFundingTime": int(datetime.strptime(x["fundingTime"], "%Y-%m-%dT%H:%M:%SZ").timestamp()),
+            }
+            for x in tickers
+        ]
 
-# --- Periodic task example ---
-async def periodic_task():
-    logger.info("Running scheduled task...")
+async def fetch_mexc():
+    url = "https://contract.mexc.com/api/v1/contract/funding_rate"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        tickers = res.json()["data"]
+        return [
+            {
+                "symbol": x["symbol"],
+                "fundingRate": float(x["fundingRate"]),
+                "nextFundingTime": int(x["nextFundingTime"] / 1000),
+            }
+            for x in tickers
+        ]
 
-# --- Main async entry point ---
+# === Alert Logic ===
+async def check_funding_rates():
+    logging.info("🔍 Checking funding rates...")
+    all_rates = []
+
+    fetchers = [fetch_binance(), fetch_bybit(), fetch_okx(), fetch_mexc()]
+    results = await asyncio.gather(*fetchers, return_exceptions=True)
+
+    for result in results:
+        if isinstance(result, list):
+            all_rates.extend(result)
+
+    now = int(datetime.utcnow().timestamp())
+    upcoming = [
+        r for r in all_rates if 0 < (r["nextFundingTime"] - now) <= 900  # within 15 min
+    ]
+
+    if not upcoming:
+        logging.info("⏳ No upcoming funding payments within 15 minutes.")
+        return
+
+    sorted_rates = sorted(upcoming, key=lambda x: abs(x["fundingRate"]), reverse=True)[:5]
+    msg_lines = ["⚠️ Top 5 Upcoming Funding Rates (Next 15min):"]
+    for r in sorted_rates:
+        msg_lines.append(f"🔹 {r['symbol']} — {r['fundingRate'] * 100:.4f}%")
+
+    msg = "\n".join(msg_lines)
+    await bot.send_message(chat_id=CHAT_ID, text=msg)
+    logging.info("✅ Alert sent.")
+
+# === Main Application ===
 async def main():
-    global application  # So it's accessible in the webhook handler
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_chat_id))  # TEMP
-
-    # Start scheduler
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(periodic_task, "interval", minutes=1)
+    scheduler.add_job(check_funding_rates, "interval", minutes=5)
     scheduler.start()
 
-    # Start the Telegram bot
-    await application.initialize()
-    await application.bot.set_webhook(WEBHOOK_URL)
-    logger.info("✅ Webhook was successfully set.")
-    await application.start()
-    logger.info("🚀 Bot is live and webhook server is running.")
-
-    # Start aiohttp webhook server
-    app = web.Application()
-    app.router.add_post("/webhook", telegram_webhook_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    # Keep running
-    await asyncio.Event().wait()
+    logging.info("🚀 Funding rate monitor running 24/7...")
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
