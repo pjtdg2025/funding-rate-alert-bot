@@ -8,20 +8,19 @@ from telegram import Bot
 # === Configuration ===
 BOT_TOKEN = "YOUR_BOT_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
-EXCHANGES = ["binance", "bybit", "okx", "mexc"]
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 
 # === Funding Rate Fetch Functions ===
 async def fetch_binance():
-    url = "https://fapi.binance.com/fapi/v1/fundingRate"
-    params = {"limit": 1}
+    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     async with httpx.AsyncClient() as client:
-        res = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex")
+        res = await client.get(url)
         data = res.json()
         return [
             {
+                "exchange": "Binance",
                 "symbol": x["symbol"],
                 "fundingRate": float(x["lastFundingRate"]),
                 "nextFundingTime": int(x["nextFundingTime"]),
@@ -34,11 +33,22 @@ async def fetch_bybit():
     async with httpx.AsyncClient() as client:
         res = await client.get(url)
         tickers = res.json()["result"]
+        now = datetime.utcnow()
+        # Assuming Bybit uses fixed 8h intervals at 00:00, 08:00, 16:00 UTC
+        next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+        funding_time = min(
+            h for h in [0, 8, 16] if h > now.hour
+        ) if now.hour < 16 else 0
+        next_funding = datetime(now.year, now.month, now.day, funding_time)
+        if next_funding < now:
+            next_funding += timedelta(days=1)
+
         return [
             {
+                "exchange": "Bybit",
                 "symbol": x["symbol"],
                 "fundingRate": float(x.get("funding_rate", 0.0)),
-                "nextFundingTime": int(datetime.utcnow().timestamp() + 60 * 60 * 8),
+                "nextFundingTime": int(next_funding.timestamp()),
             }
             for x in tickers if x["symbol"].endswith("USDT")
         ]
@@ -50,6 +60,7 @@ async def fetch_okx():
         tickers = res.json()["data"]
         return [
             {
+                "exchange": "OKX",
                 "symbol": x["instId"],
                 "fundingRate": float(x["fundingRate"]),
                 "nextFundingTime": int(datetime.strptime(x["fundingTime"], "%Y-%m-%dT%H:%M:%SZ").timestamp()),
@@ -64,6 +75,7 @@ async def fetch_mexc():
         tickers = res.json()["data"]
         return [
             {
+                "exchange": "MEXC",
                 "symbol": x["symbol"],
                 "fundingRate": float(x["fundingRate"]),
                 "nextFundingTime": int(x["nextFundingTime"] / 1000),
@@ -74,28 +86,37 @@ async def fetch_mexc():
 # === Alert Logic ===
 async def check_funding_rates():
     logging.info("🔍 Checking funding rates...")
-    all_rates = []
-
     fetchers = [fetch_binance(), fetch_bybit(), fetch_okx(), fetch_mexc()]
     results = await asyncio.gather(*fetchers, return_exceptions=True)
 
+    all_rates = []
     for result in results:
         if isinstance(result, list):
             all_rates.extend(result)
 
     now = int(datetime.utcnow().timestamp())
-    upcoming = [
-        r for r in all_rates if 0 < (r["nextFundingTime"] - now) <= 900  # within 15 min
-    ]
+    window = 2700  # 45 minutes
 
-    if not upcoming:
-        logging.info("⏳ No upcoming funding payments within 15 minutes.")
+    alerts_by_exchange = {}
+    for r in all_rates:
+        time_diff = r["nextFundingTime"] - now
+        if 0 < time_diff <= window:
+            alerts_by_exchange.setdefault(r["exchange"], []).append(r)
+
+    if not alerts_by_exchange:
+        logging.info("⏳ No funding rates 45 min before settlement.")
         return
 
-    sorted_rates = sorted(upcoming, key=lambda x: abs(x["fundingRate"]), reverse=True)[:5]
-    msg_lines = ["⚠️ Top 5 Upcoming Funding Rates (Next 15min):"]
-    for r in sorted_rates:
-        msg_lines.append(f"🔹 {r['symbol']} — {r['fundingRate'] * 100:.4f}%")
+    msg_lines = ["⚠️ Top Funding Rates (45 min before settlement):"]
+    for exchange, rates in alerts_by_exchange.items():
+        sorted_rates = sorted(rates, key=lambda x: x["fundingRate"])
+        top_neg = sorted_rates[:3]
+        top_pos = sorted_rates[-3:][::-1]
+        msg_lines.append(f"\n📌 {exchange}:")
+        for r in top_neg:
+            msg_lines.append(f"🔻 {r['symbol']} — {r['fundingRate']*100:.4f}%")
+        for r in top_pos:
+            msg_lines.append(f"🔺 {r['symbol']} — {r['fundingRate']*100:.4f}%")
 
     msg = "\n".join(msg_lines)
     await bot.send_message(chat_id=CHAT_ID, text=msg)
