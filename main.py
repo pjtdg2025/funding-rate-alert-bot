@@ -1,63 +1,91 @@
-import schedule
-import time
 import os
-import requests
-from flask import Flask
-from funding import check_all_exchanges
+import json
+import asyncio
+import logging
+from aiohttp import web
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import httpx
 
-app = Flask(__name__)
+# === Logging ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Scheduled job to check funding rates
-def job():
-    print("[INFO] Running funding rate check job...")
-    check_all_exchanges()
+# === Load from environment ===
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://yourapp.onrender.com
 
-# Function to send a test message on startup with debug logs
-def send_test_message():
-    test_message = "This is a test message from your funding rate alert bot!"
-    print("[DEBUG] Sending test message...")
-    print("[DEBUG] BOT TOKEN:", os.getenv("TELEGRAM_BOT_TOKEN"))
-    print("[DEBUG] CHAT ID:", os.getenv("TELEGRAM_CHAT_ID"))
-    send_telegram_alert(test_message)
+# === Create Application globally ===
+telegram_app = (
+    ApplicationBuilder()
+    .token(TOKEN)
+    .concurrent_updates(True)
+    .build()
+)
 
-# Send a Telegram alert
-def send_telegram_alert(message):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
-        print("[ERROR] Missing Telegram credentials")
-        return
+# === Telegram Handlers ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Bot is live. Send a ticker like BTC or ETH.")
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    response = requests.post(url, json=payload)
-    print(f"[DEBUG] Telegram response: {response.status_code} - {response.text}")
+async def handle_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().upper()
+    if text in ["BTC", "ETH", "BNB", "SOL"]:
+        await update.message.reply_text(f"🔔 Alert set for {text}")
+    else:
+        await update.message.reply_text("❌ Ticker not recognized.")
 
-# Schedule job to run every 60 seconds
-schedule.every(60).seconds.do(job)
+# === Webhook Handler ===
+async def telegram_webhook_handler(request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
+        await telegram_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Error in webhook handler: {e}")
+        return web.Response(status=500)
+    return web.Response(status=200)
 
-@app.route("/")
-def health_check():
-    return "Funding rate alert bot is running!"
+# === Setup aiohttp server ===
+async def run_webhook_server():
+    app = web.Application()
+    app.router.add_post("/webhook", telegram_webhook_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+    logger.info("🌐 Webhook server running at /webhook")
 
-# Send test message once on startup
-send_test_message()
+# === Main ===
+async def main():
+    # Add handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ticker))
+
+    # Initialize bot
+    await telegram_app.initialize()
+
+    # Start aiohttp webhook server
+    await run_webhook_server()
+
+    # Set webhook URL
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+        await client.post(
+            f"https://api.telegram.org/bot{TOKEN}/setWebhook",
+            json={"url": f"{WEBHOOK_URL}/webhook"}
+        )
+
+    logger.info("✅ Webhook set. Bot is ready.")
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()  # Optional: for scheduling or internal polling
+    await telegram_app.updater.stop()
+    await telegram_app.shutdown()
 
 if __name__ == "__main__":
-    from threading import Thread
-
-    # Background thread for running the scheduled job
-    def run_schedule():
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-
-    schedule_thread = Thread(target=run_schedule)
-    schedule_thread.start()
-
-    # Start Flask server
-    app.run(host="0.0.0.0", port=5000)
+    asyncio.run(main())
